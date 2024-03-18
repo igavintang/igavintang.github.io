@@ -1,0 +1,614 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://www.gavintang.me</id>
+    <title>Gavin Tang`s blog</title>
+    <updated>2024-03-18T18:46:09.679Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://www.gavintang.me"/>
+    <link rel="self" href="https://www.gavintang.me/atom.xml"/>
+    <subtitle>Program, algorithm and cool tech</subtitle>
+    <logo>https://www.gavintang.me/images/avatar.png</logo>
+    <icon>https://www.gavintang.me/favicon.ico</icon>
+    <rights>All rights reserved 2024, Gavin Tang`s blog</rights>
+    <entry>
+        <title type="html"><![CDATA[Nginx静态编译]]></title>
+        <id>https://www.gavintang.me/nginx-build/</id>
+        <link href="https://www.gavintang.me/nginx-build/">
+        </link>
+        <updated>2022-10-10T09:17:57.000Z</updated>
+        <content type="html"><![CDATA[<p>网上已经有很多这方面的资料，本文主要侧重以下几点，</p>
+<ul>
+<li>采用Nginx官方最新版本源码构建(不再需要QUIC版本)，以支持HTTP/3；</li>
+<li>集成Lua模块，开发高性能Web服务；</li>
+<li>集成ngx_pagespeed加速访问；</li>
+<li>全静态编译，干净又卫生:)</li>
+</ul>
+<h3 id="环境">环境</h3>
+<ul>
+<li>Debian 12</li>
+<li>GCC 12</li>
+</ul>
+<h3 id="nginx源码下载">nginx源码下载</h3>
+<pre><code class="language-shell">#2024年01月25日更新，已不需要QUIC版本，直接下载最新版本即可，当前1.25.3
+wget https://nginx.org/download/nginx-{version}.tar.gz
+
+## apt install mercurial # hg命令安装
+#hg clone -b quic https://hg.nginx.org/nginx-quic
+</code></pre>
+<h3 id="依赖模块下载">依赖模块下载</h3>
+<pre><code class="language-shell">#全部下载到modules目录，大家酌情根据需要删减或增加模块
+wget https://gigenet.dl.sourceforge.net/project/pcre/pcre/8.45/pcre-8.45.tar.gz &amp;&amp; tar -zxf pcre-8.45.tar.gz
+git clone https://github.com/FRiCKLE/ngx_cache_purge.git &amp;&amp; cd ngx_cache_purge &amp;&amp; git checkout 2.3
+git clone https://github.com/openresty/lua-nginx-module.git &amp;&amp; cd lua-nginx-module &amp;&amp; git checkout v0.10.22
+git clone https://github.com/quictls/openssl.git &amp;&amp; cd openssl &amp;&amp; git checkout openssl-3.0.5+quic
+git clone https://github.com/openresty/lua-upstream-nginx-module.git
+git clone https://github.com/vision5/ngx_devel_kit.git
+git clone https://github.com/openresty/headers-more-nginx-module &amp;&amp; cd headers-more-nginx-module &amp;&amp; git checkout v0.34
+git clone https://github.com/GUI/nginx-upstream-dynamic-servers
+git clone https://github.com/cloudflare/zlib.git
+git clone https://github.com/apache/incubator-pagespeed-ngx &amp;&amp; cd incubator-pagespeed-ngx &amp;&amp; git checkout v1.14.33.1-RC1
+git clone https://github.com/google/ngx_brotli &amp;&amp; cd ngx_brotli &amp;&amp; git submodule update --init
+git clone https://github.com/zhouchangxun/ngx_healthcheck_module.git
+</code></pre>
+<h3 id="前置准备">前置准备</h3>
+<pre><code class="language-shell"># automake
+apt install automake
+
+# http_image_filter_module模块需要
+apt install libgd-dev
+
+# perftools模块需要
+apt install libgoogle-perftools-dev
+
+# lua 支持
+git clone https://github.com/openresty/luajit2.git &amp;&amp; cd luajit2
+make &amp;&amp; make install PREFIX=/usr/local/luajit2
+export LUAJIT_LIB=/usr/local/luajit2/lib
+export LUAJIT_INC=/usr/local/luajit2/include/luajit-2.1
+
+# 一些模块需要打补丁
+# lua-nginx-module
+cd modules/lua-nginx-module
+wget https://raw.githubusercontent.com/macports/macports-ports/f8fb46b9a22f1364041832f81d606abb8b218337/www/nginx-devel/files/patch-lua_headers_in.c.diff
+git apply patch-lua_headers_in.c.diff
+
+#openssl编译
+cd modules/openssl
+./Configure no-shared enable-zlib enable-ec_nistp_64_gcc_128 --prefix=/root/softs/nginx-{version}/modules/quictls --openssldir=/root/softs/nginx-{version}/modules/quictls
+make install_dev
+cd modules &amp;&amp; mkdir -p quictls/.openssl &amp;&amp; cd quictls/.openssl &amp;&amp; \
+ln -s ../lib64 lib &amp;&amp; ln -s ../include include
+
+# pagespeed依赖psol
+cd modules/incubator-pagespeed-ngx &amp;&amp; \
+wget https://dist.apache.org/repos/dist/release/incubator/pagespeed/1.14.36.1/x64/psol-1.14.36.1-apache-incubating-x64.tar.gz &amp;&amp; tar -zxf psol-1.14.36.1-apache-incubating-x64.tar.gz &amp;&amp; rm -rf psol-1.14.36.1-apache-incubating-x64.tar.gz
+# 下载此文件覆盖对应的src/ngx_pagespeed.cc，不然会编译错误
+wget https://raw.githubusercontent.com/apache/incubator-pagespeed-ngx/dea38db4cb7370a9bbb06139798a4936be7553db/src/ngx_pagespeed.cc -O src/ngx_pagespeed.cc
+
+# zlib 编译清除
+cd zlib &amp;&amp; make -f Makefile.in distclean
+</code></pre>
+<h3 id="构建配置">构建配置</h3>
+<pre><code class="language-shell">./configure \
+  --prefix=/etc/nginx \
+  --sbin-path=/usr/sbin/nginx \
+  --modules-path=/usr/lib64/nginx/modules \
+  --conf-path=/etc/nginx/nginx.conf \
+  --error-log-path=/var/log/nginx/error.log \
+  --http-log-path=/var/log/nginx/access.log \
+  --pid-path=/var/run/nginx.pid \
+  --lock-path=/var/run/nginx.lock \
+  --http-client-body-temp-path=/var/cache/nginx/client_temp \
+  --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+  --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+  --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+  --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+  --user=nginx \
+  --group=nginx \
+  --with-compat \
+  --with-file-aio \
+  --with-threads \
+  --with-http_addition_module \
+  --with-http_auth_request_module \
+  --with-http_dav_module \
+  --with-http_flv_module \
+  --with-http_gunzip_module \
+  --with-http_gzip_static_module \
+  --with-http_mp4_module \
+  --with-http_random_index_module \
+  --with-http_realip_module \
+  --with-http_secure_link_module \
+  --with-http_slice_module \
+  --with-http_ssl_module \
+  --with-http_stub_status_module \
+  --with-http_sub_module \
+  --with-http_v2_module \
+  --with-http_v3_module \
+  --with-http_image_filter_module \
+  --with-pcre-jit \
+  --with-pcre=./modules/pcre-8.45 \
+  --with-zlib=./modules/zlib \
+  --with-openssl=./modules/quictls \
+  --with-mail \
+  --with-mail_ssl_module \
+  --with-stream \
+  --with-stream_realip_module \
+  --with-stream_ssl_module \
+  --with-stream_ssl_preread_module \
+  --with-google_perftools_module \
+  --with-cc-opt=&quot;-O3 -g -pipe -Wall -Werror=format-security -Wp,-D_FORTIFY_SOURCE=2 -Wp,-D_GLIBCXX_ASSERTIONS -fexceptions -fstack-protector-strong -grecord-gcc-switches -m64 -mtune=generic -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -fPIC&quot; \
+  --with-ld-opt=&quot;-Wl,-rpath,$LUAJIT_LIB&quot; \
+  --add-module=./modules/ngx_devel_kit \
+  --add-module=./modules/lua-nginx-module \
+  --add-module=./modules/lua-upstream-nginx-module \
+  --add-module=./modules/headers-more-nginx-module \
+  --add-module=./modules/ngx_brotli \
+  --add-module=./modules/ngx_healthcheck_module \
+  --add-module=./modules/nginx-upstream-dynamic-servers \
+  --add-module=./modules/ngx_cache_purge \
+  --add-module=./modules/incubator-pagespeed-ngx
+</code></pre>
+<h3 id="编译安装">编译安装</h3>
+<pre><code class="language-shell"># 由于openssl是预编译到quictls目录，如果编译过程出现其他错误，重新编译前也需要再次执行一下
+touch modules/quictls/.openssl/include/openssl/ssl.h
+
+make &amp;&amp; make install &amp;&amp; strip /usr/sbin/nginx
+</code></pre>
+<h3 id="服务配置">服务配置</h3>
+<pre><code class="language-shell"># 创建用户
+groupadd nginx
+useradd nginx -g nginx -s /sbin/nologin -M
+
+vi /usr/lib/systemd/system/nginx.service
+
+[Unit]
+Description=The nginx HTTP and reverse proxy server
+After=network.target remote-fs.target nss-lookup.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/nginx.pid
+# Nginx will fail to start if /var/run/nginx/nginx.pid already exists but has the wrong
+# SELinux context. This might happen when running `nginx -t` from the cmdline.
+# https://bugzilla.redhat.com/show_bug.cgi?id=1268621
+ExecStartPre=/usr/bin/mkdir -p /var/cache/nginx
+ExecStartPre=/usr/sbin/nginx -t
+ExecStart=/usr/sbin/nginx -c /etc/nginx/nginx.conf
+ExecReload=/bin/sh -c &quot;/bin/kill -s HUP $(/bin/cat /var/run/nginx.pid)&quot;
+ExecStop=/bin/sh -c &quot;/bin/kill -s TERM $(/bin/cat /var/run/nginx.pid)&quot;
+KillSignal=SIGQUIT
+TimeoutStopSec=5
+KillMode=process
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<h3 id="lua模块">Lua模块</h3>
+<pre><code class="language-shell"># 下载lua-resty-core和lua-resty-lrucache到/etc/nginx/lua_modules目录下
+git clone https://github.com/openresty/lua-resty-core.git \
+&amp;&amp; cd lua-resty-core &amp;&amp; git checkout v0.1.24
+git clone https://github.com/openresty/lua-resty-lrucache.git \
+&amp;&amp; cd lua-resty-lrucache &amp;&amp; git checkout v0.13
+</code></pre>
+<h3 id="nginx配置">Nginx配置</h3>
+<pre><code class="language-shell"># nginx.conf
+http {
+    # other conf...
+
+    lua_code_cache on;
+    lua_shared_dict limit 10m;
+    lua_socket_log_errors off;
+    lua_package_path &quot;${prefix}/lua_modules/lua-resty-core/lib/?.lua;${prefix}lua_modules/lua-resty-lrucache/lib/?.lua;&quot;;
+    lua_package_cpath &quot;${prefix}lua_modules/c_modules/?.so;&quot;;
+
+    # other conf...
+}
+</code></pre>
+<h3 id="pagespeed配置">PageSpeed配置</h3>
+<p><a href="https://gist.github.com/igavintang/798bd6c1c1a8eeabdbde76441cb9662e">Nginx PageSpeed configuration file</a></p>
+<h3 id="服务启动">服务启动</h3>
+<pre><code>systemctl enable nginx
+systemctl start nginx
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[递归]]></title>
+        <id>https://www.gavintang.me/recursion/</id>
+        <link href="https://www.gavintang.me/recursion/">
+        </link>
+        <updated>2018-10-31T03:14:37.000Z</updated>
+        <summary type="html"><![CDATA[<p><strong>递归</strong>（Recursion），是一种解决问题的方法或编程技巧，将问题分解为更小的子问题，直到得到一个足够小的问题可以被简单的解决；通常递归涉及函数的自身调用，递归允许我们编写优雅的解决方案，解决可能很难编程的问题。</p>
+]]></summary>
+        <content type="html"><![CDATA[<p><strong>递归</strong>（Recursion），是一种解决问题的方法或编程技巧，将问题分解为更小的子问题，直到得到一个足够小的问题可以被简单的解决；通常递归涉及函数的自身调用，递归允许我们编写优雅的解决方案，解决可能很难编程的问题。</p>
+<!-- more -->
+<h3 id="递归三定律">递归三定律</h3>
+<ul>
+<li><strong>可分解成子问题</strong> 递归的逻辑是能够将问题分解成数据规模更小和更容易的问题来解决的优雅表达，子问题就是数据规模更小的问题，比如「前n项有序数列求和」的问题，可以分解为求解「前n-1项有序数列求和」这样一个子问题；</li>
+<li><strong>子问题求解思路一致</strong> 问题与分解的子问题之间，除了数据规模不同，所有子问题的求解思路一致，如求解「前n项有序数列求和」的思路，和「前n-1项有序数列求和」的思路，是一模一样的；</li>
+<li><strong>终止条件</strong> 递归必须具有基本情况，通常是足够小可以直接求解的问题，递归算法必须改变其状态并向基本情况靠近，如「前n项有序数列求和」的例子是 sum(1) = 1，这就是递归的终止条件；</li>
+</ul>
+<h3 id="递推公式">递推公式</h3>
+<p>写代码之前的关键是找到将大问题分解为小问题的规律，并基于此找到递推公式和终止条件，最终转化成递归代码。</p>
+<pre><code class="language-go">// 有序数列求和 1+2+3+4+...+100
+// 递推公式 sum(n) = sum(n - 1) + n
+// 终止条件 sum(1) = 1
+func sum(n int) int {
+    if n == 1 {
+        return 1
+    } else {
+        return sum(n-1) + n
+    }
+}
+</code></pre>
+<h3 id="经验技巧">经验&amp;技巧</h3>
+<ul>
+<li>防止递归堆栈溢出；</li>
+<li>避免重复子问题计算；</li>
+<li>递归代码调试(打印日志、设置条件断点)；</li>
+<li>权衡有无必要改写成非递归代码；</li>
+</ul>
+<h3 id="总结">总结</h3>
+<p>递归是一种非常高效、简洁的编码技巧。只要是满足「递归三定律」的问题就可以通过递归代码来求解。<br>
+不过编写递归代码的关键就是不要把自己绕进去，正确姿势是写出递推公式，找出终止条件，然后再翻译成递归代码。递归代码虽然简洁，但递归代码也有很多弊端。比如，堆栈溢出、重复计算、函数调用耗时多、空间复杂度高等，所以，在编写递归代码的时候，一定要控制好这些副作用。<br>
+针对空间复杂度高的问题，可以考虑实现尾递归，进而通过编译器进行尾递归优化（Tail Call Optimization, TCO）。尾递归比通常的线性递归多一个参数，这个参数是上一次调用函数得到的结果；关键在于尾递归每次调用都在收集结果，避免了线性递归不收集结果只能依次展开消耗内存的坏处。<br>
+如果编译器针对尾递归形式的递归代码作了优化，就可能把原本需要线性复杂度栈内存空间的执行过程用常数复杂度的空间完成，这个优化是 O(n) 到 O(1) 的。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[队列]]></title>
+        <id>https://www.gavintang.me/queue/</id>
+        <link href="https://www.gavintang.me/queue/">
+        </link>
+        <updated>2018-10-24T04:48:46.000Z</updated>
+        <summary type="html"><![CDATA[<p><strong>队列</strong>（Queue）和栈非常相似，它们的底层实现几乎完全相同，只是操作方式不同。可以把队列想象成银行排队取款，先来的先取，后来的人只能站末尾，不允许插队。先进先出，这就是典型的「队列」。最基本的操作也是两个：入队 enqueue()，放一个元素到队列尾部；出队 dequeue()，从队列头部取一个元素。</p>
+]]></summary>
+        <content type="html"><![CDATA[<p><strong>队列</strong>（Queue）和栈非常相似，它们的底层实现几乎完全相同，只是操作方式不同。可以把队列想象成银行排队取款，先来的先取，后来的人只能站末尾，不允许插队。先进先出，这就是典型的「队列」。最基本的操作也是两个：入队 enqueue()，放一个元素到队列尾部；出队 dequeue()，从队列头部取一个元素。</p>
+<!-- more -->
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184071642-b49b9041-1afd-4ca7-8ea5-6eeeff7c923d.png" alt="Queue" loading="lazy"></figure>
+<p>实际上，对于大部分资源有限的场景，当没有空闲资源时，基本上都可以通过「队列」这种数据结构来实现请求排队。作为一种非常基础的数据结构，队列的应用也非常广泛，特别是一些具有某些额外特性的队列，比如循环队列、阻塞队列、并发队列。</p>
+<h3 id="队列实现">队列实现</h3>
+<p>队列和栈一样，也是一种抽象的数据结构。它具有先进先出的特性，支持在队尾插入元素，在队头删除元素。同样，队列可以用数组来实现，也可以用链表来实现。用数组实现的队列叫作顺序队列，用链表实现的队列叫作链式队列。</p>
+<pre><code class="language-cpp">// 用数组实现的队列
+class ArrayQueue {
+ public:
+    // 入队操作，将item放入队尾
+    bool Enqueue(const std::string&amp; item) {
+        // tail == n表示队列末尾没有空间了
+        if (tail_ == capacity_) {
+            // tail ==n &amp;&amp; head==0，表示整个队列都占满了
+            if (head_ == 0) return false;
+            // 数据搬移
+            for (int i = head_; i &lt; tail_; ++i) {
+                items_[i-head_] = items_[i];
+            }
+            // 搬移完之后重新更新head和tail
+            tail_ -= head_;
+            head_ = 0;
+        }
+        items_[tail_] = item;
+        ++tail_;
+        return true;
+    }
+
+    // 出队
+    std::string Dequeue() {
+        // 如果head_ == tail_ 表示队列为空
+        if (head_ == tail_) return &quot;&quot;;
+        std::string ret = items_[head_++];
+        ++head_;
+        return ret;
+    }
+
+    // 申请一个大小为capacity的数组
+    explicit ArrayQueue(int capacity) :
+        items_(new std::string[capacity]()),
+        capacity_(capacity) {}
+
+    ~ArrayQueue() {
+        delete [] items_;
+    }
+
+ private:
+    // 数组：items，数组大小：n
+    std::string* items_;
+    int capacity_ = 0;
+    // head表示队头下标，tail表示队尾下标
+    int head_ = 0;
+    int tail_ = 0;
+};
+</code></pre>
+<p>上面的代码，出队操作的时间复杂度是 O(1)，入队操作最好是 O(1)，最坏是 O(n)。<br>
+在进行 n 次搬移操作之前，必定有 n 次入队操作。所以用摊还分析法，入队操作的均摊复杂度为 O(1)。</p>
+<h3 id="高级队列">高级队列</h3>
+<ul>
+<li>阻塞队列，在队列基础上增加了阻塞操作，简单来说就是在队列为空的时候，从队头取数据会被阻塞，因为此时还没有数据可取，直到队列中有了数据才能返回，如果队列已满，那么插入数据的操作就会被阻塞；</li>
+<li>并发队列，线程安全的队列我们叫作并发队列，最简单直接的实现方式是直接在 enqueue()、dequeue() 方法上加锁，但是锁粒度大并发度会比较低，同一时刻仅允许一个存或者取操作，实际上基于数组的循环队列，利用 CAS 原子操作可以实现非常高效的并发队列；</li>
+</ul>
+<h3 id="总结">总结</h3>
+<p>队列和栈一样，也是一种操作受限的线性数据结构，只支持入队和出队操作，先进先出是它最大的特点。和栈一样，用数组实现的叫顺序队列，用链表实现的叫链式队列。在数组实现队列的时候，会有数据搬移操作，要想解决数据搬移的问题，可以考虑要循环队列。除此之外，还有一些高级的队列结构，阻塞队列、并发队列，底层都还是队列这种数据结构，只不过在之上附加了很多其他功能。阻塞队列就是入队、出队操作可以阻塞，并发队列就是队列的操作多线程安全。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[栈]]></title>
+        <id>https://www.gavintang.me/stack/</id>
+        <link href="https://www.gavintang.me/stack/">
+        </link>
+        <updated>2018-10-17T06:30:39.000Z</updated>
+        <summary type="html"><![CDATA[<p><strong>栈</strong>（Stack）是计算机中描述的一种操作受限的线性表结构，这种数据结构只允许在一端插入和删除数据，即：先进后出/后进先出，这就是典型的「栈」结构。</p>
+<p>当某个数据集合只涉及在一端插入和删除数据，并且满足后进先出、先进后出的特性，这时我们就应该首选「栈」这种数据结构。</p>
+]]></summary>
+        <content type="html"><![CDATA[<p><strong>栈</strong>（Stack）是计算机中描述的一种操作受限的线性表结构，这种数据结构只允许在一端插入和删除数据，即：先进后出/后进先出，这就是典型的「栈」结构。</p>
+<p>当某个数据集合只涉及在一端插入和删除数据，并且满足后进先出、先进后出的特性，这时我们就应该首选「栈」这种数据结构。</p>
+<!-- more -->
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184071564-37c923c7-6972-4cda-a703-4cf1e8c89b52.png" alt="Stack" loading="lazy"></figure>
+<h3 id="栈的实现">栈的实现</h3>
+<p>从上面的定义可以看出，栈主要包含出栈和入栈两个操作，在栈顶插入和栈顶删除一个数据。实际上栈可以用数组来实现，也可以用链表来实现，用数组实现叫顺序栈，用链表实现叫做链式栈。</p>
+<pre><code class="language-cpp">// 基于固定大小的数组实现的顺序栈
+class ArrayStack {
+ public:
+    // 入栈操作
+    bool Push(const std::string &amp;item) {
+        // 数组空间不够了，直接返回false，入栈失败。
+        if (size_ == capacity_) return false;
+        // 将item放到下标为size_的位置，并且size_加一
+        items_[size_++] = item;
+        return true;
+    }
+
+    // 出栈操作
+    std::string Pop() {
+        // 栈为空，则直接返回null
+        if (size_ == 0)
+            return &quot;&quot;;
+        // 返回下标为size-1的数组元素，并且栈中元素数size减1
+        std::string tmp = items_[size_ - 1];
+        size_--;
+        return tmp;
+    }
+
+    explicit ArrayStack(int capacity) :
+        items_(new std::string[capacity]()),
+        capacity_(capacity) {}
+
+    ~ArrayStack() {
+        delete [] items_;
+    }
+
+ private:
+    std::string* items_ = nullptr;  // 数组
+    int size_ = 0;  // 栈中元素数
+    int capacity_ = 0;  // 栈容量
+};
+</code></pre>
+<p>不管是顺序栈还是链式栈，我们存储数据只需要一个大小为 capacity 的数组就够了。在入栈和出栈过程中，只需要一两个临时变量存储空间，所以空间复杂度是 O(1)。</p>
+<p>同样，入栈、出栈只涉及栈顶个别数据的操作，所以时间复杂度都是 O(1)。</p>
+<p><strong>支持动态扩容的顺序栈</strong></p>
+<p>上面是基于数组实现的固定大小的栈，在初始化栈时需要事先指定栈的大小，当栈满之后就无法再往栈里添加数据了。尽管链式栈的大小不受限，但要存储 next 指针，内存消耗相对较多。那我们可以基于支持动态扩容的数组来支持动态扩容。当数组空间不够时，我们就重新申请一块更大的内存，将原来数组中数据统统拷贝过去。这样就实现了一个支持动态扩容的数组，但在实际应用中并不常用。</p>
+<p>对于出栈操作来说，我们不会涉及内存的重新申请和数据的搬移，所以出栈的时间复杂度仍然是 O(1)。但是，对于入栈操作，当栈中有空闲空间时，入栈操作的时间复杂度为 O(1)。但当空间不够时，就需要重新申请内存和数据搬移，所以时间复杂度就变成了 O(n)。</p>
+<p>另外，平均情况可以通过摊还分析法来分析，大部分情况下都是最好时间复杂度O(1)，极端情况下才是最坏时间复杂度 O(n)，且循环往复，具有规律性，即 1 个 O(n)入栈操作后，紧跟着 n-1 个 O(1) 入栈操作。所以，入栈操作的均摊时间复杂度为 O(1)。均摊时间复杂度一般都等于最好情况时间复杂度。</p>
+<h3 id="栈的应用">栈的应用</h3>
+<ul>
+<li>函数调用</li>
+<li>表达式求值</li>
+<li>括号匹配</li>
+</ul>
+<h3 id="总结">总结</h3>
+<p>栈是一种操作受限的线性数据结构，只支持入栈和出栈操作。后进先出是它最大的特点。栈既可以通过数组实现，也可以通过链表来实现。不管基于数组还是链表，入栈、出栈的时间复杂度都为 O(1)。对于支持动态扩容的顺序栈，通过摊还分析法来分析均摊时间复杂度。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[链表]]></title>
+        <id>https://www.gavintang.me/linkedlist/</id>
+        <link href="https://www.gavintang.me/linkedlist/">
+        </link>
+        <updated>2018-10-12T12:10:52.000Z</updated>
+        <summary type="html"><![CDATA[<p><strong>链表</strong>（Linked list）相比数组，是一种稍微复杂一些的数据结构。这两个非常基础、非常常用的数据结构，我们常常会放到一块儿来比较。从底层存储结构来说，数组需要一块连续的内存空间来存储，对内存要求相对较高，比如申请一个200MB大小的数组，当内存剩余的总空间即便大于200MB，但如果不是连续的一块内存，申请也会失败。而链表则相反，它不要求连续的的内存空间，即通过指针将一组零散的内存块串联起来使用，对内存要求较低。</p>
+]]></summary>
+        <content type="html"><![CDATA[<p><strong>链表</strong>（Linked list）相比数组，是一种稍微复杂一些的数据结构。这两个非常基础、非常常用的数据结构，我们常常会放到一块儿来比较。从底层存储结构来说，数组需要一块连续的内存空间来存储，对内存要求相对较高，比如申请一个200MB大小的数组，当内存剩余的总空间即便大于200MB，但如果不是连续的一块内存，申请也会失败。而链表则相反，它不要求连续的的内存空间，即通过指针将一组零散的内存块串联起来使用，对内存要求较低。</p>
+<!-- more -->
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184071180-f51d2f9c-7e90-4eff-acca-9e5970864b32.png" alt="Memory distribution" loading="lazy"></figure>
+<p>链表结构有很多，但我们常用的典型结构有单链表、双向链表、循环链表。</p>
+<h3 id="单链表">单链表</h3>
+<p>有两个结点是比较特殊的，它们分别是头节点（第一个结点）和尾节点（最后一个结点），其中，头结点用来记录链表的首地址，通过首节点就可以遍历整个链表；而尾结点的指针不是指向下一个结点，而是指向一个空地址NULL，表示这是链表上最后一个结点。</p>
+<figure data-type="image" tabindex="2"><img src="https://user-images.githubusercontent.com/9823338/184071245-66482214-db2a-4eb9-9927-ced46b1d07e3.png" alt="Single linked list" loading="lazy"></figure>
+<p>与数组一样，链表也支持插入、删除以及查找操作，只不过数组为了保持内存的连续性，需要做大量的数据搬移，时间复杂度是O(n)，而在链表中插入或删除一条数据则只需要考虑修改相邻节点指针指向即可，所以对应的操作时间复杂度为O(1)。</p>
+<p>但是有利就有弊， 因为链表的内存分布是不连续的，无法像数组一样根据地址和下标，通过寻址公式来直接计算出内存地址，例如访问第K个节点元素，则需要从头节点指针开始一个一个的依次遍历，所以也就没有数组的随机访问的优势，时间复杂度为 O(n) 。</p>
+<h3 id="循环链表">循环链表</h3>
+<p>和单链表唯一的区别就是循环链表的尾节点指向了首节点而不是NULL，就像一个环形一样的首尾相连，所以称之为循环链表；当要处理的数据具有环型结构特点时，就特别适合采用循环链表，例如当运行多个应用程序时，操作系统通常会把这些程序存入一个链表，并进行循环遍历，给每个应用程序分配一定的时间来执行，以方便简洁的从头部重新开始遍历。</p>
+<figure data-type="image" tabindex="3"><img src="https://user-images.githubusercontent.com/9823338/184071350-1fe9b037-0669-469b-a581-daa3832bef8c.png" alt="Cycle linked list" loading="lazy"></figure>
+<h3 id="双向链表">双向链表</h3>
+<p>顾名思义，单链表只有一个指向后继节点的next指针， 而双向链表是比单链表多了一个指向前驱节点的prev指针。</p>
+<figure data-type="image" tabindex="4"><img src="https://user-images.githubusercontent.com/9823338/184071419-381a49b1-72ba-4424-8716-d3b4ded73e24.png" alt="Doubly linked list" loading="lazy"></figure>
+<p>通过「给定值」来删除节点，无论是单向链表或双向链表， 基本没什么区别，都需要从头节点开始一个个遍历节点，直到找到该值，再进行删除操作，时间复杂度为O(n)。</p>
+<p>但若是通过「给定节点」的指针来删除节点，由于删除操作需要知道被删除节点的前驱节点，而单链表无法直接获取前驱节点，所有需要从头节点开始遍历，时间复杂度为O(n)，双向链表可以直接通过存储的前驱节点来完成操作，时间复杂度为O(1)；同理，对于「给定节点」的后面插入一个节点也是一样的。</p>
+<h3 id="经验技巧">经验&amp;技巧</h3>
+<ul>
+<li>理解指针，毕竟操作链表到处都是指针或引用；</li>
+<li>防指针丢失，修改关联节点指针的操作顺序很重要，避免指针丢失，如果指针丢失则会发生内存泄漏；</li>
+<li>哨兵节点，引入哨兵结点，head指针一直指向这个哨兵结点，有哨兵结点的链表也叫带头链表；哨兵模式是一种简化代码实现难度的编程技巧，用来优化边界问题；</li>
+</ul>
+<h3 id="总结">总结</h3>
+<figure data-type="image" tabindex="5"><img src="https://user-images.githubusercontent.com/9823338/184071469-31f26ebd-f870-4643-a1df-e15501ac418f.png" alt="Complexity" loading="lazy"></figure>
+<p>通过观察不难发现，相比之下数组简单易用，在实现上使用的是连续的内存空间，可以借助 CPU 缓存机制，预读数组中的数据，随机访问效率也更高；而链表在内存中并不是连续存储，所以对 CPU 缓存不友好，没办法有效预读。和数组相比，链表更适合插入、删除操作频繁的场景，但查询的时间复杂度更高。在实际的软件开发过程中，不能仅仅利用复杂度分析就决定使用哪种数据结构来存储数据，要对数组和链表在具体的场景下做性能对比来综合选择。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[数组]]></title>
+        <id>https://www.gavintang.me/array/</id>
+        <link href="https://www.gavintang.me/array/">
+        </link>
+        <updated>2018-10-10T12:56:02.000Z</updated>
+        <summary type="html"><![CDATA[<p><strong>数组</strong>（Array）在逻辑上是一种线性表数据结构，在物理上是顺序存储结构，它用一组「连续的内存空间」存储一组具有「类型相同」的数据；正因为这两个约束使得数组具备随机访问的特性，但同时要想在数组中插入或删除数据，为了保证连续性，就需要做大量的数据搬移工作。</p>
+]]></summary>
+        <content type="html"><![CDATA[<p><strong>数组</strong>（Array）在逻辑上是一种线性表数据结构，在物理上是顺序存储结构，它用一组「连续的内存空间」存储一组具有「类型相同」的数据；正因为这两个约束使得数组具备随机访问的特性，但同时要想在数组中插入或删除数据，为了保证连续性，就需要做大量的数据搬移工作。</p>
+<!-- more -->
+<h3 id="线性表">线性表</h3>
+<p>提到线性表（Linear list），除了数组，链表、队列以及栈等也是线性表数据结构，线性表就是数据排成像一条线一样的数据结构，每个线性表上除首尾节点外最多只有一个前驱节点和后继节点，具有「一对一」的关系，存储上分为顺序存储结构和链式存储结构。</p>
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184070939-eee5c88c-528b-4f5e-8e71-20e8171100c7.png" alt="Linear" loading="lazy"></figure>
+<p>与线性表相反的概念是非线性表，如树结构和图结构等，之所以非线性，是因为在非线性表中的数据之间并不是前后的关系，即非「一对一」的关系。</p>
+<figure data-type="image" tabindex="2"><img src="https://user-images.githubusercontent.com/9823338/184071061-d0c224dc-8ff1-449d-95e3-ddbe5f73ca41.png" alt="Nolinear" loading="lazy"></figure>
+<h3 id="随机访问">随机访问</h3>
+<p>数组通过下标随机访问数组内元素，例如一个长度为 10 的 数组 int32 a[10] = {0}，计算机给数组 a[10] 分配了一块连续内存空间 1000～1039，这里内存块的首地址 base_address = 1000，计算机会给每个内存单元分配一个地址，计算机通过地址来访问内存中的数据，当计算机需要随机访问数组中某个元素时，通过以下寻址公式计算：</p>
+<pre><code class="language-c">a[i]_address = base_address + i * type_size // type_size 为数组的每个元素的大小(int32为4字节)
+</code></pre>
+<h4 id="为何下标从0开始">为何下标从0开始</h4>
+<p>从数组存储的内存模型上来看，「下标」最确切的定义应该是「偏移（offset）」。如果用 a 表示数组的首地址，a[0] 就是偏移为 0 的位置，也就是首地址，a[k] 就表示偏移 k 个 type_size 的位置，所以计算 a[k] 的内存地址公式为：</p>
+<pre><code>a[k]_address = base_address + k * type_size
+</code></pre>
+<p>如果数组从 1 开始计数，数组元素 a[k] 的内存地址公式为：</p>
+<pre><code>a[k]_address = base_address + (k-1) * type_size
+</code></pre>
+<p>对比两个公式，从 1 开始编号，每次随机访问数组元素都多了一次减法运算，对于 CPU 来说，就多了一次减法指令。数组作为非常基础的数据结构，通过下标随机访问数组元素又是其非常基础的编程操作，效率的优化就要尽可能做到极致。所以为了减少一次减法操作，数组选择了从 0 开始编号，而不是从 1 开始。</p>
+<h4 id="数组越界访问">数组越界访问</h4>
+<p>数组越界在 C 语言中是一种未决行为，并没有规定数组访问越界时编译器应该如何处理。因为，访问数组的本质就是访问一段连续内存，只要数组通过偏移计算得到的内存地址是可用的，那么程序就可能不会报任何错误。</p>
+<h3 id="插入与删除">插入与删除</h3>
+<p>前面概念中提到，数组为了保持内存数据的连续性，会导致插入或删除需要做大量的数据搬移工作，因此变得比较低效。</p>
+<p>假设数组的长度为 n，如果需要将一个数据插入到数组中的第 k 个位置，为了把第 k 个位置腾出来给新来的数据，需要将第 k～n 这部分元素都顺序地往后挪一位。如果在数组的末尾插入元素，那就不需要移动数据了，这时的时间复杂度为 O(1)。但如果在数组的开头插入元素，那所有的数据都需要依次往后移动一位，所以最坏时间复杂度是 O(n)。 因为在每个位置插入元素的概率是一样的，所以平均情况时间复杂度为 (1+2+...n)/n=O(n)。</p>
+<p>如果数组中的数据是有序的，在某个位置插入一个新的元素时，就必须按照刚才的方法搬移 k 之后的数据。但是，如果数组中存储的数据并没有任何规律，数组只是被当作一个存储数据的集合。在这种情况下，如果要将某个数据插入到第 k 个位置，为了避免大规模的数据搬移，可以直接将第 k 位的数据搬移到数组元素的最后，把新的元素直接放入第 k 个位置。</p>
+<p>利用这种处理技巧，在特定场景下，在第 k 个位置插入一个元素的时间复杂度就会降为 O(1)，这种处理思想在快排中也会用到。</p>
+<p>删除也类似，可以采用标记法，当空间不足时触发一次性删除操作。</p>
+<h3 id="数组与链表区别">数组与链表区别</h3>
+<ul>
+<li>数组用一段连续的内存空间存储一组类型相同的数据并支持随机访问，根据下标随机访问的时间复杂度为 O(1)，插入和删除操作需搬运大量数据；</li>
+<li>而链表则相反，内存空间不连续且不支持随机访问，链表的插入和删除操作无需搬运数据，时间复杂度 O(1)；</li>
+</ul>
+<h3 id="总结">总结</h3>
+<p>数组是最基础、最简单的数据结构了，数组用一块连续的内存空间，来存储相同类型的一组数据，最大的特点就是支持随机访问，但插入、删除操作也因此变得比较低效，平均情况时间复杂度为 O(n)。但如果是底层开发，使用数组可能会比高级语言提供的容器类更合适。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[算法复杂度分析]]></title>
+        <id>https://www.gavintang.me/algorithm-complexity/</id>
+        <link href="https://www.gavintang.me/algorithm-complexity/">
+        </link>
+        <updated>2018-10-05T03:34:16.000Z</updated>
+        <summary type="html"><![CDATA[<h3 id="为什么需要复杂度分析">为什么需要复杂度分析？</h3>
+<p>通过统计、监控，就能得到算法执行时间和占用的内存大小，但测试结果非常依赖测试环境，测试结果受数据规模与有序度的影响较大；所以需要一个不用具体的测试数据来测试，就可以粗略地估计算法的执行效率的方法，这就是算法复杂度分析。</p>
+]]></summary>
+        <content type="html"><![CDATA[<h3 id="为什么需要复杂度分析">为什么需要复杂度分析？</h3>
+<p>通过统计、监控，就能得到算法执行时间和占用的内存大小，但测试结果非常依赖测试环境，测试结果受数据规模与有序度的影响较大；所以需要一个不用具体的测试数据来测试，就可以粗略地估计算法的执行效率的方法，这就是算法复杂度分析。</p>
+<!-- more -->
+<h3 id="算法复杂度">算法复杂度</h3>
+<p>一个算法有多好、多快，怎么衡量一个算法的好坏？计算机科学在算法分析过程中提出了算法复杂度理论，这套理论可以量化算法的效率，以此作为标准来衡量到底选择哪一种算法；复杂度有两个维度，分别为时间和空间。</p>
+<p>一个实现了某算法的程序：</p>
+<ul>
+<li>如果计算的速度越快，那么这个算法时间复杂度越低；</li>
+<li>如果占用的计算资源越少，那么空间复杂度越低；</li>
+<li>要选择复杂度低的算法，衡量好空间和时间的消耗，选出适合特定场景的算法；</li>
+</ul>
+<p>算法执行时间用 T(n) 表示，如每行代码执行总次数用 f(n) 表示，使得当 n 趋近于无穷大时，T(n) / f(n) 的极限值为不等于零的常数，则称 f(n) 是 T(n) 的同数量级函数，记作 T(n) = O(f(n))；O表示代码的执行时间 T(n) 与 f(n) 表达式成正比，表达代码的执行时间随数据规模增长的变化趋势，所以也称 O(f(n)) 为算法的渐进时间复杂度，简称时间复杂度。</p>
+<h3 id="渐进符号">渐进符号</h3>
+<p>如何量化复杂度，到底有多复杂？计算机科学其实抽象出了几个复杂度渐进符号：O(Omicron)、ο(omicron)、Θ(Theta)、Ω(Omega) 以及 ω(omega)；下面着重介绍一下 O(Omicron)，我们习惯读作大O。</p>
+<p>假设算法的运行时间表达式为 T(n)= 3 * n^2 + 4 * n^3，如果问题规模 n 足够大，那么低次方的项将无足轻重，运行时间主要取决于高次方项 4 * n^3，随着 n 的增大，4 * n^3 中的常数项 4 也变得不重要了，所以算法的运行时间 T(n) 约等于 n^3，记为 T(n) = O(n^3)。</p>
+<p>例如 f(n) = 2n^2 + 1，则时间复杂度 T(n) = O(2n^2+1)，通常会忽略「低阶、常量、系数」，因为当 n 很大时并不影响增长趋势，最终写成 T(n) = O(n^2)。</p>
+<p>大O 的数学含义：<br>
+设 f(n) 和 g(n) 是定义域 n 为自然数集合的函数， f(n) 函数的阶不高于 g(n) 函数的阶；也可以说，存在正常量 c 和 n0，对于所有 n &gt;= n0，有 0 &lt;= f(n) &lt;= c * g(n)，那么可以记为 f(n) = O(g(n))，g(n) 是 f(n) 的渐进上界。</p>
+<p>下图展示了几种符号的函数形式：</p>
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184070754-6348e539-7e77-42de-8c5f-4c972bb036c3.jpg" alt="Complexity" loading="lazy"></figure>
+<p>当 n 为某个值时：</p>
+<ul>
+<li>如果 f(n) 被 g(n) 两条线夹在中间，那么 g(n) 就是渐进紧确界；</li>
+<li>如果 g(n) 的线在上面，就是渐进上界；</li>
+<li>如果 g(n) 线在下面，就是渐进下界；</li>
+</ul>
+<p>我们一般会评估一个算法的渐进上界O，因为这表示算法的最坏情况。</p>
+<h3 id="时间复杂度分析技巧">时间复杂度分析技巧</h3>
+<ul>
+<li>只关注循环执行次数最多的一段代码；</li>
+<li>加法法则，总复杂度等于量级最大的那段代码的复杂度；</li>
+<li>乘法法则，嵌套代码的复杂度等于嵌套内外代码复杂度的乘积；</li>
+</ul>
+<h3 id="最好-最坏与平均复杂度">最好、最坏与平均复杂度</h3>
+<ul>
+<li>最好时间复杂度是指在最理想的情况下执行代码的时间复杂度；</li>
+<li>最坏时间复杂度是指在最糟糕的情况下执行代码的时间复杂度；</li>
+<li>平均时间复杂度可以通过计算加权平均值（也叫期望值）得出，所以也叫加权平均时间复杂度或期望时间复杂度；</li>
+</ul>
+<h3 id="均摊时间复杂度">均摊时间复杂度</h3>
+<p>通过摊还分析法（或者叫平摊分析）来分析均摊时间复杂度，其实可以认为一种特殊的平均时间复杂度。<br>
+在多数情况下使用一个复杂度表示即可（比如最坏时间复杂度），只有在同一块代码的不同情况下，时间复杂度有量级的差距，才会使用最好、最坏、平均三种复杂度表示法来区分，而均摊复杂度应用的场景更加有限。</p>
+<p>另外，平均时间复杂度对不同操作出现的概率不同进行加权平均，不强调操作的次序问题；而均摊时间复杂度针对操作的某个次序来求得总的时间复杂度，再均摊到各个操作步骤。故平均时间复杂度没有涉及到操作次序，而均摊时间复杂度涉及到，所以在一些合适的场景下，均摊时间复杂度对数据结构操作复杂度的估计具有更加的真实性。</p>
+<h3 id="案例分析">案例分析</h3>
+<pre><code class="language-c">// 全局变量，大小为 10 的数组 array，长度 len，下标 i。
+int array[] = new int[10]; 
+int len = 10;
+int i = 0;
+
+// 往数组中添加一个元素
+void add(int element) {
+   if (i &gt;= len) { // 数组空间不够了
+     // 重新申请一个 2 倍大小的数组空间
+     int new_array[] = new int[len*2];
+     // 把原来 array 数组中的数据依次 copy 到 new_array
+     for (int j = 0; j &lt; len; ++j) {
+       new_array[j] = array[j];
+     }
+     // new_array 复制给 array，array 现在大小就是 2 倍 len 了
+     array = new_array;
+     len = 2 * len;
+   }
+   // 将 element 放到下标为 i 的位置，下标 i 加一
+   array[i] = element;
+   ++i;
+}
+</code></pre>
+<p>当 i &lt; len 时，即 i = 0, 1, 2, ..., n-1 的时候，for循环不执行，所以 n 次的时间复杂度都是 O(1)；<br>
+当 i &gt;= len时，即 i = n 的时候，for循环进行数组的copy，所以只有这1次的时间复杂度是 O(n)；<br>
+由此可知：</p>
+<ul>
+<li>该算法的最好情况时间复杂度为 O(1)；</li>
+<li>最坏情况时间复杂度为 O(n)；</li>
+<li>平均情况时间复杂度：
+<ul>
+<li>第一种计算方式是简单把每种情况操作次数累加后对 n+1 种情况求平均，即 (1+1+...+1+n)/(n+1) = 2n/(n+1)，简化后平均时间复杂度为 O(1)；</li>
+<li>第二种计算方式是利用加权平均法，一共有 n+1 种情况，每种情况发生的概率一样，即 p=1/(n+1），那么可以得到：1<em>p+1</em>p+...+1<em>p+n</em>p=1，所以平均时间复杂度还是 O(1)；</li>
+<li>第三种计算方式是利用摊还分析法，前 n 个操作复杂度都是 O(1)，第 n+1 次操作的复杂度是 O(n)，所以把最后一次的复杂度分摊到前 n 次上，那么均摊下来每次操作的时间复杂度为 O(1)；</li>
+</ul>
+</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[数据结构与算法介绍]]></title>
+        <id>https://www.gavintang.me/data-structure-and-algorithm-Introduction/</id>
+        <link href="https://www.gavintang.me/data-structure-and-algorithm-Introduction/">
+        </link>
+        <updated>2018-09-29T08:55:09.000Z</updated>
+        <summary type="html"><![CDATA[<blockquote>
+<p>通过学习 <a href="https://time.geekbang.org/column/intro/126">数据结构与算法之美</a> 专栏、相关书籍以及资料后形成本系列的 <a href="/tag/GU4uZdQGs/">#数据结构与算法</a> 学习笔记。</p>
+</blockquote>
+<h3 id="为什么要学习数据结构与算法">为什么要学习数据结构与算法？</h3>
+<p>建立时间和空间复杂度意识，写出高质量的代码，能够设计基础架构，提升编程技能，训练逻辑思维，积攒人生经验，以此获得工作回报，实现你的价值，完善你的人生。</p>
+]]></summary>
+        <content type="html"><![CDATA[<blockquote>
+<p>通过学习 <a href="https://time.geekbang.org/column/intro/126">数据结构与算法之美</a> 专栏、相关书籍以及资料后形成本系列的 <a href="/tag/GU4uZdQGs/">#数据结构与算法</a> 学习笔记。</p>
+</blockquote>
+<h3 id="为什么要学习数据结构与算法">为什么要学习数据结构与算法？</h3>
+<p>建立时间和空间复杂度意识，写出高质量的代码，能够设计基础架构，提升编程技能，训练逻辑思维，积攒人生经验，以此获得工作回报，实现你的价值，完善你的人生。</p>
+<!-- more -->
+<p>所以，不管你是业务开发工程师，还是基础架构工程师；不管你是初入职场的初级工程师，还是工作多年的资深架构师，又或者是想转人工智能这些热门领域的程序员，数据结构与算法作为计算机的基础知识、核心知识，都是必须要掌握的。</p>
+<p>掌握了数据结构与算法，看待问题的深度，解决问题的角度就会完全不一样。就像是站在巨人的肩膀上，拿着生存利器行走世界。数据结构与算法，会为你的编程之路，甚至人生之路打开一扇通往新世界的大门。</p>
+<h3 id="什么是数据结构与算法">什么是数据结构与算法？</h3>
+<p>从广义上讲，数据结构是指一组数据的存储结构，算法是指操作数据的一组方法；从狭义上讲，是指某些著名的经典数据结构与算法，比如队列、栈、堆、二分查找、动态规划等。</p>
+<p>从大的方面来说，数据结构是反应数据的一种形式，分为逻辑结构和物理结构：</p>
+<ul>
+<li>逻辑结构，它是表现数据之间一种关系的结构，分为线性结构和非线性结构；</li>
+<li>物理结构，它是表现数据是如何存储的，计算机内部是如何安排该数据的存储，通常分为顺序存储结构、链式存储结构、索引存储结构以及哈希存储结构；</li>
+</ul>
+<h3 id="数据结构与算法的关系">数据结构与算法的关系</h3>
+<p>数据结构为算法服务，算法要作用于特定的数据结构之上；数据结构与算法是相辅相成的，因此无法孤立数据结构来单独讲算法。</p>
+<h3 id="学习重点">学习重点</h3>
+<p>复杂度分析要吃透，它是数据结构与算法的精髓；学习重点应放在最常用、最重要的数据结构与算法，总结如下：</p>
+<ul>
+<li>10个数据结构分别为数组、链表、栈、队列、散列表、二叉树、堆、跳表、图、Trie树；</li>
+<li>10个算法分别为递归、排序、二分查找、搜索、哈希算法、贪心算法、分治算法、回溯算法、动态规划、字符串匹配；</li>
+</ul>
+<h3 id="学习技巧">学习技巧</h3>
+<p>遇到「困难」尝试反复迭代学习并不断沉淀，代码实现一遍、适度刷题巩固知识点；多思考并记笔记或博客与他人分享互动。</p>
+<h3 id="知识图谱">知识图谱</h3>
+<figure data-type="image" tabindex="1"><img src="https://user-images.githubusercontent.com/9823338/184070387-d9839924-0d28-478e-a439-1c8029aa6399.png" alt="Data Structure and Algorithm Roadmap" loading="lazy"></figure>
+]]></content>
+    </entry>
+</feed>

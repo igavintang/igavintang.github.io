@@ -1,0 +1,56 @@
+User-agent: *
+Disallow: /
+User-agent: Baiduspider
+Allow: /
+User-agent: SogouSpider
+Allow: /
+User-agent: Sogou web spider
+Allow: /
+User-agent: Sogou inst spider
+Allow: /
+User-agent: Sogou spider2
+Allow: /
+User-agent: Sogou blog
+Allow: /
+User-agent: Sogou News Spider
+Allow: /
+User-agent: Sogou Orion spider
+Allow: /
+User-agent: Googlebot
+Allow: /
+User-agent: Googlebot-image
+Allow: /
+User-agent: Googlebot-news
+Allow: /
+User-agent: googlebot-mobile
+Allow: /
+User-agent: DuckDuckBot
+Allow: /
+User-agent: Bingbot
+Allow: /
+User-agent: Slurp
+Allow: /
+User-agent: Teoma
+Allow: /
+User-agent: ia_archiver
+Allow: /
+User-agent: twiceler
+Allow: /
+User-agent: Scrubby
+Allow: /
+User-agent: Robozilla
+Allow: /
+User-agent: Gigabot
+Allow: /
+User-agent: yahoo-mmcrawler
+Allow: /
+User-agent: yahoo-blogs/v3.9
+Allow: /
+User-agent: Yandex
+Allow: /
+User-agent: 360Spider
+Allow: /
+User-agent: psbot
+Allow: /
+Crawl-delay: 60
+Sitemap: https://www.gavintang.me/atom.xml
